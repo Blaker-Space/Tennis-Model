@@ -9,7 +9,7 @@ import numpy as np
 import cv2
 import pandas as pd
 
-from extract_human_pose import (
+from extract_joint_positions import (
     HumanPoseExtractor,
 )
 
