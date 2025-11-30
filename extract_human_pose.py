@@ -9,6 +9,8 @@ from argparse import ArgumentParser
 import tensorflow as tf
 import numpy as np
 import cv2
+import os
+import glob
 
 
 class RoI:
@@ -194,9 +196,42 @@ class HumanPoseExtractor:
         "right_ankle": 16,
     }
 
-    def __init__(self, shape):
+    def __init__(self, shape, model_path: str = None):
+        # Determine model path
+        if model_path is None:
+            model_path = "movenet.tflite"
+
+        model_file = None
+
+        # If model_path points to an existing file, use it
+        if os.path.isfile(model_path):
+            model_file = model_path
+        else:
+            # If it's a directory, try to find any .tflite inside
+            if os.path.isdir(model_path):
+                candidates = glob.glob(os.path.join(model_path, "*.tflite"))
+                if candidates:
+                    model_file = candidates[0]
+
+            # Try common alternatives in the current working directory
+            if model_file is None:
+                candidates = glob.glob(os.path.join(os.getcwd(), "movenet*.tflite"))
+                if candidates:
+                    model_file = candidates[0]
+
+            # Try specifically inside a folder named movenet.tflite
+            if model_file is None:
+                candidates = glob.glob(os.path.join(os.getcwd(), "movenet.tflite", "*.tflite"))
+                if candidates:
+                    model_file = candidates[0]
+
+        if model_file is None:
+            raise FileNotFoundError(
+                f"Could not find a .tflite model. Looked for '{model_path}', 'movenet*.tflite' and 'movenet.tflite/*.tflite' in the current directory."
+            )
+
         # Initialize the TFLite interpreter
-        self.interpreter = tf.lite.Interpreter(model_path="movenet.tflite")
+        self.interpreter = tf.lite.Interpreter(model_path=model_file)
         self.interpreter.allocate_tensors()
 
         self.roi = RoI(shape)
