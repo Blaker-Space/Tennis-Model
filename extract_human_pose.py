@@ -9,6 +9,8 @@ from argparse import ArgumentParser
 import tensorflow as tf
 import numpy as np
 import cv2
+import os
+import glob
 
 
 class RoI:
@@ -18,131 +20,132 @@ class RoI:
     movenet neural network.
     """
 
-class RoI:
-    """
-    Region of Interest around the player with smoothing and hysteresis
-    to avoid frequent resets on small/low-confidence detections (pickleball-friendly).
-    """
-
-    # Tunables for pickleball singles (player is small/far)
-    MIN_SIDE = 80             # was effectively ~150; lower it
-    MAX_SIDE_FACTOR = 1.0     # 1.0 * frame smaller side
-    ZOOM_MARGIN = 1.35        # inflate bbox (keeps context)
-    EMA_ALPHA = 0.35          # smoothing for center/size (0=no smooth, 1=instant)
-    MIN_CONF = 0.20           # min confidence for keypoints considered "good"
-    MIN_GOOD_KP = 5           # need at least this many confident keypoints
-    BAD_FRAMES_BEFORE_RESET = 6  # grace period before hard reset
-
     def __init__(self, shape):
-        self.frame_height = shape[0]
         self.frame_width = shape[1]
-
-        self.center_x = self.frame_width // 2
-        self.center_y = self.frame_height // 2
-        side0 = min(self.frame_width, self.frame_height)
-        self.width = side0
-        self.height = side0
-
-        self._max_side = int(side0 * self.MAX_SIDE_FACTOR)
+        self.frame_height = shape[0]
+        self.width = self.frame_width
+        self.height = self.frame_height
+        self.center_x = shape[1] // 2
+        self.center_y = shape[0] // 2
         self.valid = False
-        self._bad_frames = 0  # how many consecutive bad frames
-
-    def _bounds(self):
-        x1 = max(0, self.center_x - self.width // 2)
-        y1 = max(0, self.center_y - self.height // 2)
-        x2 = min(self.frame_width, self.center_x + self.width // 2)
-        y2 = min(self.frame_height, self.center_y + self.height // 2)
-        return x1, y1, x2, y2
 
     def extract_subframe(self, frame):
-        x1, y1, x2, y2 = self._bounds()
-        if x2 <= x1 or y2 <= y1:
-            return frame  # fallback (prevents gray frames)
-        return frame[y1:y2, x1:x2]
+        """Extract the RoI from the original frame"""
+        subframe = frame.copy()
+        return subframe[
+            self.center_y - self.height // 2 : self.center_y + self.height // 2,
+            self.center_x - self.width // 2 : self.center_x + self.width // 2,
+        ]
 
     def transform_to_subframe_coordinates(self, keypoints_from_tf):
-        # Multiply Y by height, X by width (TF outputs normalized [y, x, score])
-        return np.squeeze(np.multiply(keypoints_from_tf, [self.height, self.width, 1.0]))
+        """Key points from tensorflow come as float number betwen 0 and 1,
+        describing (x, y) coordinates in the image feeding the NN
+        We transform them into sub frame pixel coordinates
+        """
+        return np.squeeze(
+            np.multiply(keypoints_from_tf, [self.width, self.width, 1])
+        ) - np.array([(self.width - self.height) // 2, 0, 0])
 
     def transform_to_frame_coordinates(self, keypoints_from_tf):
-        kps_sub = self.transform_to_subframe_coordinates(keypoints_from_tf)
-        x1, y1, x2, y2 = self._bounds()
-        kps_frame = kps_sub.copy()
-        kps_frame[:, 0] += y1  # y
-        kps_frame[:, 1] += x1  # x
-        return kps_frame
+        """Key points from tensorflow come as float number betwen 0 and 1,
+        describing (x, y) coordinates in the image feeding the NN
+        We transform them into frame pixel coordinates
+        """
+        keypoints_pixels_subframe = self.transform_to_subframe_coordinates(
+            keypoints_from_tf
+        )
+        keypoints_pixels_frame = keypoints_pixels_subframe.copy()
+        keypoints_pixels_frame[:, 0] += self.center_y - self.height // 2
+        keypoints_pixels_frame[:, 1] += self.center_x - self.width // 2
 
-    def _ema(self, old, new):
-        return int(round(self.EMA_ALPHA * new + (1 - self.EMA_ALPHA) * old))
+        return keypoints_pixels_frame
 
     def update(self, keypoints_pixels):
-        """Update RoI using robust rules: min size, smoothing, and grace period."""
-        if keypoints_pixels is None or keypoints_pixels.ndim != 2:
-            self._note_bad_and_maybe_reset(reason="no keypoints array")
+        """Update RoI with new keypoints"""
+        min_x = int(min(keypoints_pixels[:, 1]))
+        min_y = int(min(keypoints_pixels[:, 0]))
+        max_x = int(max(keypoints_pixels[:, 1]))
+        max_y = int(max(keypoints_pixels[:, 0]))
+
+        self.center_x = (min_x + max_x) // 2
+        self.center_y = (min_y + max_y) // 2
+
+        prob_mean = np.mean(keypoints_pixels[keypoints_pixels[:, 2] != 0][:, 2])
+        if self.width != self.frame_width and prob_mean < 0.3:
+            print(
+                f"Lost player track --> reset ROI because prob is too low = {prob_mean}"
+            )
+            self.reset()
             return
 
-        # Keep only confident keypoints
-        conf_mask = keypoints_pixels[:, 2] >= self.MIN_CONF
-        good_count = int(np.sum(conf_mask))
-        if good_count < self.MIN_GOOD_KP:
-            self._note_bad_and_maybe_reset(reason=f"too few good kps ({good_count})")
+        # keep next dimensions always a bit larger
+        self.width = int((max_x - min_x) * 1.3)
+        self.height = int((max_y - min_y) * 1.3)
+
+        if self.height < 150 or self.width < 10:
+            print(
+                f"Lost player track --> reset ROI because height = {self.height} "
+                f"and width = {self.width}"
+            )
+            self.reset()
             return
 
-        pts = keypoints_pixels[conf_mask][:, :2]
-        min_y, min_x = np.min(pts[:, 0]).astype(int), np.min(pts[:, 1]).astype(int)
-        max_y, max_x = np.max(pts[:, 0]).astype(int), np.max(pts[:, 1]).astype(int)
+        self.width = max(self.width, self.height)
+        self.height = max(self.width, self.height)
 
-        # Inflate box a bit for context
-        w = int((max_x - min_x) * self.ZOOM_MARGIN)
-        h = int((max_y - min_y) * self.ZOOM_MARGIN)
-        side = max(w, h, self.MIN_SIDE)
-        side = min(side, self._max_side)
+        if self.center_x + self.width // 2 >= self.frame_width:
+            self.center_x = self.frame_width - self.width // 2 - 1
 
-        cx_new = (min_x + max_x) // 2
-        cy_new = (min_y + max_y) // 2
+        if 0 > self.center_x - self.width // 2:
+            self.center_x = self.width // 2 + 1
 
-        # Smooth center/size to avoid jitter
-        self.center_x = self._ema(self.center_x, cx_new)
-        self.center_y = self._ema(self.center_y, cy_new)
-        self.width = self._ema(self.width, side)
-        self.height = self.width  # keep square
+        if self.center_y + self.height // 2 >= self.frame_height:
+            self.center_y = self.frame_height - self.height // 2 - 2
 
-        # Keep in-bounds
-        half = self.width // 2
-        self.center_x = min(max(self.center_x, half + 1), self.frame_width - half - 1)
-        self.center_y = min(max(self.center_y, half + 1), self.frame_height - half - 1)
+        if 0 > self.center_y - self.height // 2:
+            self.center_y = self.height // 2 + 1
 
-        # If after clamping the ROI collapses, treat as bad
-        x1, y1, x2, y2 = self._bounds()
-        if x2 - x1 <= 1 or y2 - y1 <= 1:
-            self._note_bad_and_maybe_reset(reason="collapsed after clamp")
+        # Reset if Out of Bound
+        if self.center_x + self.width // 2 >= self.frame_width:
+            self.reset()
             return
 
-        # Good update
-        self._bad_frames = 0
+        # Reset if Out of Bound
+        if self.center_y + self.height // 2 >= self.frame_height:
+            self.reset()
+            return
+
+        assert 0 <= self.center_x - self.width // 2
+        assert self.center_x + self.width // 2 < self.frame_width
+        assert 0 <= self.center_y - self.height // 2
+        assert self.center_y + self.height // 2 < self.frame_height
+
+        # Set valid to True
         self.valid = True
 
-    def _note_bad_and_maybe_reset(self, reason=""):
-        self._bad_frames += 1
-        if self._bad_frames >= self.BAD_FRAMES_BEFORE_RESET:
-            # print(f"Lost player track --> reset ROI ({reason})")
-            self.reset()
-
     def reset(self):
-        side0 = min(self.frame_width, self.frame_height)
-        self.width = side0
-        self.height = side0
+        """
+        Reset the RoI with width/height corresponding to the whole image
+        """
+        self.width = self.frame_width
+        self.height = self.frame_height
         self.center_x = self.frame_width // 2
         self.center_y = self.frame_height // 2
+
         self.valid = False
-        self._bad_frames = 0
 
     def draw_shot(self, frame, shot):
+        """Draw shot name in orange around bounding box"""
         cv2.putText(
-            frame, shot,
+            frame,
+            shot,
             (self.center_x - 50, self.center_y - self.height // 2 - 20),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 255, 255), 2
+            cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=0.8,
+            color=(128, 255, 255),
+            thickness=2,
         )
+
 
 class HumanPoseExtractor:
     """
@@ -193,9 +196,42 @@ class HumanPoseExtractor:
         "right_ankle": 16,
     }
 
-    def __init__(self, shape):
+    def __init__(self, shape, model_path: str = None):
+        # Determine model path
+        if model_path is None:
+            model_path = "movenet.tflite"
+
+        model_file = None
+
+        # If model_path points to an existing file, use it
+        if os.path.isfile(model_path):
+            model_file = model_path
+        else:
+            # If it's a directory, try to find any .tflite inside
+            if os.path.isdir(model_path):
+                candidates = glob.glob(os.path.join(model_path, "*.tflite"))
+                if candidates:
+                    model_file = candidates[0]
+
+            # Try common alternatives in the current working directory
+            if model_file is None:
+                candidates = glob.glob(os.path.join(os.getcwd(), "movenet*.tflite"))
+                if candidates:
+                    model_file = candidates[0]
+
+            # Try specifically inside a folder named movenet.tflite
+            if model_file is None:
+                candidates = glob.glob(os.path.join(os.getcwd(), "movenet.tflite", "*.tflite"))
+                if candidates:
+                    model_file = candidates[0]
+
+        if model_file is None:
+            raise FileNotFoundError(
+                f"Could not find a .tflite model. Looked for '{model_path}', 'movenet*.tflite' and 'movenet.tflite/*.tflite' in the current directory."
+            )
+
         # Initialize the TFLite interpreter
-        self.interpreter = tf.lite.Interpreter(model_path=r"movenet.tflite\movenet_singlepose_lightning.tflite")
+        self.interpreter = tf.lite.Interpreter(model_path=model_file)
         self.interpreter.allocate_tensors()
 
         self.roi = RoI(shape)
