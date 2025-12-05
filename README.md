@@ -124,5 +124,8 @@ python visualize_features.py <shot.csv>
 
 Open and run the notebooks inside `model_training/`.
 
+## Dataset
+The original dataset used in this project was created by Antoine Keller https://github.com/antoinekeller/tennis_shot_recognition
+
 ---
 
